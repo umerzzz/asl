@@ -6,6 +6,7 @@ This script helps you verify your camera, lighting, and hand detection are worki
 import cv2
 import numpy as np
 import time
+import mediapipe as mp
 
 class SetupTester:
     def __init__(self):
@@ -17,88 +18,39 @@ class SetupTester:
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         
-        # Setup hand detection
-        self.lower_skin1 = np.array([0, 20, 70], dtype=np.uint8)
-        self.upper_skin1 = np.array([20, 255, 255], dtype=np.uint8)
-        self.lower_skin2 = np.array([170, 20, 70], dtype=np.uint8)
-        self.upper_skin2 = np.array([180, 255, 255], dtype=np.uint8)
-    
-    def is_likely_hand(self, contour, frame_shape):
-        """Analyze contour to determine if it's likely a hand"""
-        area = cv2.contourArea(contour)
-        if area < 3000 or area > 50000:
-            return False, 0
-        
-        x, y, w, h = cv2.boundingRect(contour)
-        
-        # Aspect ratio check
-        aspect_ratio = float(w) / h if h > 0 else 0
-        if aspect_ratio < 0.5 or aspect_ratio > 2.0:
-            return False, 0
-        
-        # Position check - hands not in top area (where faces are)
-        frame_h, frame_w = frame_shape[:2]
-        center_y_ratio = (y + h // 2) / frame_h
-        if center_y_ratio < 0.15:
-            return False, 0
-        
-        # Size check
-        frame_area = frame_w * frame_h
-        area_ratio = area / frame_area
-        if area_ratio < 0.01 or area_ratio > 0.3:
-            return False, 0
-        
-        # Convexity defects check
-        try:
-            hull = cv2.convexHull(contour, returnPoints=False)
-            if len(hull) > 3:
-                defects = cv2.convexityDefects(contour, hull)
-                if defects is not None:
-                    defect_count = len(defects)
-                    if defect_count >= 3:
-                        score = 1.0
-                        if center_y_ratio < 0.3:
-                            score *= 0.5
-                        if 0.3 < center_y_ratio < 0.7:
-                            score *= 1.2
-                        if 0.7 < aspect_ratio < 1.3:
-                            score *= 1.1
-                        return True, score
-        except:
-            pass
-        
-        if 0.3 < center_y_ratio < 0.7 and 0.7 < aspect_ratio < 1.3:
-            return True, 0.8
-        
-        return False, 0
+        # Initialize MediaPipe Hands
+        print("Initializing MediaPipe hand detection...")
+        self.mp_hands = mp.solutions.hands
+        self.mp_drawing = mp.solutions.drawing_utils
+        self.hands = self.mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.5
+        )
+        print("MediaPipe ready!")
     
     def detect_hand(self, frame):
-        """Detect hand in frame with improved filtering"""
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        mask1 = cv2.inRange(hsv, self.lower_skin1, self.upper_skin1)
-        mask2 = cv2.inRange(hsv, self.lower_skin2, self.upper_skin2)
-        mask = cv2.bitwise_or(mask1, mask2)
+        """Detect hand using MediaPipe"""
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        rgb_frame.flags.writeable = False
+        results = self.hands.process(rgb_frame)
+        rgb_frame.flags.writeable = True
         
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if contours:
-            # Filter to find most likely hand
-            hand_candidates = []
-            for contour in contours:
-                is_hand, score = self.is_likely_hand(contour, frame.shape)
-                if is_hand:
-                    area = cv2.contourArea(contour)
-                    hand_candidates.append((contour, area, score))
+        if results.multi_hand_landmarks:
+            hand_landmarks = results.multi_hand_landmarks[0]
+            h, w = frame.shape[:2]
+            x_coords = [landmark.x * w for landmark in hand_landmarks.landmark]
+            y_coords = [landmark.y * h for landmark in hand_landmarks.landmark]
             
-            if hand_candidates:
-                hand_candidates.sort(key=lambda x: (x[2], x[1]), reverse=True)
-                best_contour, area, score = hand_candidates[0]
-                x, y, w, h = cv2.boundingRect(best_contour)
-                return x, y, w, h, area, True
+            x_min, x_max = int(min(x_coords)), int(max(x_coords))
+            y_min, y_max = int(min(y_coords)), int(max(y_coords))
+            
+            width = x_max - x_min
+            height = y_max - y_min
+            area = width * height
+            
+            return x_min, y_min, width, height, area, True
         
         return 0, 0, 0, 0, 0, False
     
@@ -177,38 +129,27 @@ class SetupTester:
             frame = cv2.flip(frame, 1)  # Mirror
             frame_count += 1
             
-            # Detect hand and show all detected objects
-            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-            mask1 = cv2.inRange(hsv, self.lower_skin1, self.upper_skin1)
-            mask2 = cv2.inRange(hsv, self.lower_skin2, self.upper_skin2)
-            mask = cv2.bitwise_or(mask1, mask2)
-            kernel = np.ones((5, 5), np.uint8)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            
-            # Show all detected skin-colored objects (for debugging)
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if area > 1000:  # Only show significant contours
-                    x_obj, y_obj, w_obj, h_obj = cv2.boundingRect(contour)
-                    is_hand, score = self.is_likely_hand(contour, frame.shape)
-                    if is_hand:
-                        cv2.rectangle(frame, (x_obj, y_obj), (x_obj + w_obj, y_obj + h_obj), (0, 255, 0), 2)
-                        cv2.putText(frame, "HAND", (x_obj, y_obj - 5),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-                    else:
-                        cv2.rectangle(frame, (x_obj, y_obj), (x_obj + w_obj, y_obj + h_obj), (0, 0, 255), 1)
-                        cv2.putText(frame, "FILTERED", (x_obj, y_obj - 5),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 0, 255), 1)
-            
-            # Detect hand
+            # Detect hand using MediaPipe
             x, y, w, h, area, hand_detected = self.detect_hand(frame)
+            
+            # Draw hand landmarks if detected
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            rgb_frame.flags.writeable = False
+            results = self.hands.process(rgb_frame)
+            rgb_frame.flags.writeable = True
+            
+            if results.multi_hand_landmarks:
+                hand_landmarks = results.multi_hand_landmarks[0]
+                self.mp_drawing.draw_landmarks(
+                    frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS,
+                    self.mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
+                    self.mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2)
+                )
             
             if hand_detected:
                 hand_detections += 1
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 3)
-                cv2.putText(frame, "HAND DETECTED", (x, y - 10),
+                cv2.putText(frame, "HAND DETECTED (MediaPipe)", (x, y - 10),
                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
             else:
                 # Draw center region
@@ -230,16 +171,12 @@ class SetupTester:
             
             # Display information
             y_offset = 30
-            # Count filtered vs accepted objects
-            total_objects = len([c for c in contours if cv2.contourArea(c) > 1000])
-            filtered_objects = total_objects - (1 if hand_detected else 0)
-            
             info_lines = [
                 f"Lighting: {lighting_status} (Brightness: {mean_bright:.0f}, Contrast: {std_bright:.0f})",
                 f"Background: {bg_status}",
-                f"Hand Detection: {'YES' if hand_detected else 'NO'}",
+                f"Hand Detection: {'YES (MediaPipe)' if hand_detected else 'NO'}",
                 f"Detection Rate: {(hand_detections/frame_count*100):.1f}%",
-                f"Objects Detected: {total_objects} (Filtered: {filtered_objects})",
+                f"Detection Method: MediaPipe Hand Tracking",
             ]
             
             if hand_detected:
@@ -295,6 +232,7 @@ class SetupTester:
         
         # Final report
         self.cap.release()
+        self.hands.close()
         cv2.destroyAllWindows()
         
         print("\n" + "="*70)

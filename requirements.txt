@@ -5,4 +5,6 @@ matplotlib>=3.5.0
 scikit-learn>=1.0.0
 pyautogui>=0.9.54
 Pillow>=9.0.0
+mediapipe>=0.10.0
+ultralytics>=8.0.0
 
