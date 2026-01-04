@@ -8,35 +8,108 @@ from sklearn.model_selection import train_test_split
 import cv2
 from pathlib import Path
 import matplotlib.pyplot as plt
+from collections import Counter
+
+# Configure GPU for RTX 3070 (8GB VRAM)
+print("="*70)
+print("CONFIGURING GPU FOR TRAINING")
+print("="*70)
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        # Enable memory growth to prevent TensorFlow from allocating all GPU memory
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"[OK] Found {len(gpus)} GPU(s): {[gpu.name for gpu in gpus]}")
+        print("[OK] GPU memory growth enabled")
+        # Set mixed precision for better performance on RTX GPUs
+        try:
+            tf.keras.mixed_precision.set_global_policy('mixed_float16')
+            print("[OK] Mixed precision training enabled (float16)")
+        except:
+            print("[INFO] Mixed precision not available, using float32")
+    except RuntimeError as e:
+        print(f"[WARNING] GPU configuration error: {e}")
+        print("[INFO] Continuing with CPU...")
+else:
+    print("[WARNING] No GPU detected!")
+    print("[INFO] Training will use CPU (will be slower)")
+    print("\nTo enable GPU support:")
+    print("  1. Install CUDA Toolkit (11.8 or 12.x)")
+    print("  2. Install cuDNN")
+    print("  3. Install tensorflow[and-cuda] or tensorflow-gpu")
+    print("  4. Verify with: python -c \"import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))\"")
 
 # Set random seeds for reproducibility
 np.random.seed(42)
 tf.random.set_seed(42)
 
-# Configuration
+# Configuration - Optimized for RTX 3070 8GB VRAM
 IMG_SIZE = 64
-BATCH_SIZE = 32
+BATCH_SIZE = 64  # Increased for GPU (can go up to 128 if needed)
 EPOCHS = 20
-DATA_DIR = 'asl'
+BASE_DATA_DIR = 'dataset'
 
-def load_data(data_dir):
-    """Load images and labels from directory structure"""
-    images = []
-    labels = []
-    class_names = []
+# Define all dataset paths
+DATASET_PATHS = [
+    'dataset/asl',  # Original dataset with lowercase letters
+    'dataset/alphabet and numbers 1',  # First Kaggle dataset
+    'dataset/alphabet and numbers 2',  # Second Kaggle dataset
+    'dataset/asl_alphabet_train/asl_alphabet_train',  # Third Kaggle dataset (nested)
+]
+
+def normalize_class_name(class_name):
+    """Normalize class names: convert lowercase letters to uppercase, keep special classes as-is"""
+    # If it's a single lowercase letter, convert to uppercase
+    if len(class_name) == 1 and class_name.isalpha() and class_name.islower():
+        return class_name.upper()
+    # Keep numbers and special classes (nothing, space, unknown, del) as-is
+    return class_name
+
+def load_data_from_directory(dataset_path, class_mapping, images, labels):
+    """Load images from a single dataset directory"""
+    if not os.path.exists(dataset_path):
+        print(f"  [SKIP] Dataset path not found: {dataset_path}")
+        return
     
-    # Get all class directories (excluding 'asl' subfolder)
-    classes = sorted([d for d in os.listdir(data_dir) 
-                     if os.path.isdir(os.path.join(data_dir, d)) and d != 'asl'])
+    print(f"  Loading from: {dataset_path}")
     
-    print(f"Found {len(classes)} classes: {classes}")
+    # Get all class directories
+    if not os.path.isdir(dataset_path):
+        return
     
-    for idx, class_name in enumerate(classes):
-        class_path = os.path.join(data_dir, class_name)
-        image_files = [f for f in os.listdir(class_path) if f.endswith('.jpeg')]
+    classes = [d for d in os.listdir(dataset_path) 
+               if os.path.isdir(os.path.join(dataset_path, d))]
+    
+    # Exclude nested 'asl' folder if it exists
+    if 'asl' in classes and os.path.isdir(os.path.join(dataset_path, 'asl')):
+        # Check if 'asl' folder contains more folders (it's a nested structure)
+        asl_path = os.path.join(dataset_path, 'asl')
+        nested_classes = [d for d in os.listdir(asl_path) 
+                         if os.path.isdir(os.path.join(asl_path, d))]
+        if nested_classes:
+            # Skip the 'asl' folder, it's just a container
+            classes = [c for c in classes if c != 'asl']
+    
+    for class_name in classes:
+        class_path = os.path.join(dataset_path, class_name)
+        if not os.path.isdir(class_path):
+            continue
         
-        print(f"Loading {len(image_files)} images for class '{class_name}'")
+        # Normalize class name
+        normalized_name = normalize_class_name(class_name)
         
+        # Get or create class index
+        if normalized_name not in class_mapping:
+            class_mapping[normalized_name] = len(class_mapping)
+        
+        class_idx = class_mapping[normalized_name]
+        
+        # Load images (support both .jpg and .jpeg)
+        image_files = [f for f in os.listdir(class_path) 
+                      if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        
+        loaded_count = 0
         for img_file in image_files:
             img_path = os.path.join(class_path, img_file)
             img = cv2.imread(img_path)
@@ -46,14 +119,61 @@ def load_data(data_dir):
                 img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
                 img = img.astype('float32') / 255.0
                 images.append(img)
-                labels.append(idx)
+                labels.append(class_idx)
+                loaded_count += 1
         
-        class_names.append(class_name)
+        if loaded_count > 0:
+            print(f"    Class '{class_name}' -> '{normalized_name}': {loaded_count} images")
+
+def load_data():
+    """Load images and labels from all dataset directories"""
+    images = []
+    labels = []
+    class_mapping = {}  # Maps normalized class name to index
     
-    return np.array(images), np.array(labels), class_names
+    print("="*70)
+    print("LOADING DATA FROM MULTIPLE DATASETS")
+    print("="*70)
+    
+    # Load from all dataset paths
+    for dataset_path in DATASET_PATHS:
+        load_data_from_directory(dataset_path, class_mapping, images, labels)
+    
+    # Create sorted class names list
+    class_names = sorted(class_mapping.keys(), key=lambda x: (
+        # Sort: numbers first (0-9), then letters (A-Z), then special classes
+        (0, int(x)) if x.isdigit() else (1, x) if x.isalpha() else (2, x)
+    ))
+    
+    # Create reverse mapping: old_index -> normalized_name -> new_index
+    old_to_name = {idx: name for name, idx in class_mapping.items()}
+    name_to_new = {name: idx for idx, name in enumerate(class_names)}
+    
+    # Remap labels to sorted indices
+    labels_remapped = [name_to_new[old_to_name[label]] for label in labels]
+    
+    print("\n" + "="*70)
+    print(f"TOTAL DATASET SUMMARY")
+    print("="*70)
+    print(f"Total images loaded: {len(images)}")
+    print(f"Total classes: {len(class_names)}")
+    print(f"Classes: {class_names}")
+    
+    # Print class distribution
+    label_counts = Counter(labels_remapped)
+    print("\nClass distribution:")
+    for idx, class_name in enumerate(class_names):
+        count = label_counts.get(idx, 0)
+        print(f"  {class_name}: {count} images")
+    
+    return np.array(images), np.array(labels_remapped), class_names
 
 def create_model(num_classes, img_size=64):
-    """Create CNN model for ASL classification"""
+    """Create CNN model for ASL classification with GPU optimization"""
+    # Use mixed precision policy if enabled
+    policy = tf.keras.mixed_precision.global_policy()
+    use_mixed_precision = (policy.name == 'mixed_float16')
+    
     model = keras.Sequential([
         # First Convolutional Block
         layers.Conv2D(32, (3, 3), activation='relu', input_shape=(img_size, img_size, 3)),
@@ -86,14 +206,15 @@ def create_model(num_classes, img_size=64):
         layers.Dropout(0.5),
         layers.Dense(256, activation='relu'),
         layers.Dropout(0.5),
-        layers.Dense(num_classes, activation='softmax')
+        # Output layer: use float32 for softmax when using mixed precision
+        layers.Dense(num_classes, activation='softmax', dtype='float32' if use_mixed_precision else None)
     ])
     
     return model
 
 def main():
     print("Loading dataset...")
-    images, labels, class_names = load_data(DATA_DIR)
+    images, labels, class_names = load_data()
     
     print(f"\nDataset loaded:")
     print(f"  Total images: {len(images)}")
@@ -126,9 +247,18 @@ def main():
     print("\nCreating model...")
     model = create_model(len(class_names), IMG_SIZE)
     
-    # Compile model
+    # Compile model with GPU optimizations
+    # Use higher learning rate for GPU training
+    optimizer = keras.optimizers.Adam(learning_rate=0.001)
+    
+    # If using mixed precision, wrap optimizer
+    policy = tf.keras.mixed_precision.global_policy()
+    if policy.name == 'mixed_float16':
+        optimizer = tf.keras.mixed_precision.LossScaleOptimizer(optimizer)
+        print("[INFO] Using mixed precision with loss scaling")
+    
     model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=0.001),
+        optimizer=optimizer,
         loss='sparse_categorical_crossentropy',
         metrics=['accuracy']
     )

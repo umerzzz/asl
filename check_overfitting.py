@@ -5,35 +5,119 @@ from sklearn.model_selection import train_test_split
 import cv2
 import os
 import glob
+import pickle
+from collections import Counter
 
 # Configuration
 IMG_SIZE = 64
-DATA_DIR = 'asl'
+BASE_DATA_DIR = 'dataset'
+CLASS_NAMES_PATH = 'class_names.pkl'
 
-def load_data(data_dir):
-    """Load images and labels from directory structure"""
-    images = []
-    labels = []
-    class_names = []
+# Define all dataset paths
+DATASET_PATHS = [
+    'dataset/asl',  # Original dataset with lowercase letters
+    'dataset/alphabet and numbers 1',  # First Kaggle dataset
+    'dataset/alphabet and numbers 2',  # Second Kaggle dataset
+    'dataset/asl_alphabet_train/asl_alphabet_train',  # Third Kaggle dataset (nested)
+]
+
+def normalize_class_name(class_name):
+    """Normalize class names: convert lowercase letters to uppercase, keep special classes as-is"""
+    # If it's a single lowercase letter, convert to uppercase
+    if len(class_name) == 1 and class_name.isalpha() and class_name.islower():
+        return class_name.upper()
+    # Keep numbers and special classes (nothing, space, unknown, del) as-is
+    return class_name
+
+def load_data_from_directory(dataset_path, class_names, images, labels):
+    """Load images from a single dataset directory using predefined class names"""
+    if not os.path.exists(dataset_path):
+        print(f"  [SKIP] Dataset path not found: {dataset_path}")
+        return
     
-    classes = sorted([d for d in os.listdir(data_dir) 
-                     if os.path.isdir(os.path.join(data_dir, d)) and d != 'asl'])
+    print(f"  Loading from: {dataset_path}")
     
-    for idx, class_name in enumerate(classes):
-        class_path = os.path.join(data_dir, class_name)
-        image_files = [f for f in os.listdir(class_path) if f.endswith('.jpeg')]
+    # Get all class directories
+    if not os.path.isdir(dataset_path):
+        return
+    
+    classes = [d for d in os.listdir(dataset_path) 
+               if os.path.isdir(os.path.join(dataset_path, d))]
+    
+    # Exclude nested 'asl' folder if it exists
+    if 'asl' in classes and os.path.isdir(os.path.join(dataset_path, 'asl')):
+        # Check if 'asl' folder contains more folders (it's a nested structure)
+        asl_path = os.path.join(dataset_path, 'asl')
+        nested_classes = [d for d in os.listdir(asl_path) 
+                         if os.path.isdir(os.path.join(asl_path, d))]
+        if nested_classes:
+            # Skip the 'asl' folder, it's just a container
+            classes = [c for c in classes if c != 'asl']
+    
+    # Create mapping from class name to index
+    class_to_idx = {name: idx for idx, name in enumerate(class_names)}
+    
+    for class_name in classes:
+        class_path = os.path.join(dataset_path, class_name)
+        if not os.path.isdir(class_path):
+            continue
         
+        # Normalize class name
+        normalized_name = normalize_class_name(class_name)
+        
+        # Only load if this class exists in the saved class names
+        if normalized_name not in class_to_idx:
+            continue
+        
+        class_idx = class_to_idx[normalized_name]
+        
+        # Load images (support both .jpg and .jpeg)
+        image_files = [f for f in os.listdir(class_path) 
+                      if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        
+        loaded_count = 0
         for img_file in image_files:
             img_path = os.path.join(class_path, img_file)
             img = cv2.imread(img_path)
             
             if img is not None:
+                # Resize and normalize
                 img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
                 img = img.astype('float32') / 255.0
                 images.append(img)
-                labels.append(idx)
+                labels.append(class_idx)
+                loaded_count += 1
         
-        class_names.append(class_name)
+        if loaded_count > 0:
+            print(f"    Class '{class_name}' -> '{normalized_name}': {loaded_count} images")
+
+def load_data(class_names):
+    """Load images and labels from all dataset directories using predefined class names"""
+    images = []
+    labels = []
+    
+    print("="*70)
+    print("LOADING DATA FROM MULTIPLE DATASETS")
+    print("="*70)
+    print(f"Using class names from training: {len(class_names)} classes")
+    
+    # Load from all dataset paths
+    for dataset_path in DATASET_PATHS:
+        load_data_from_directory(dataset_path, class_names, images, labels)
+    
+    print("\n" + "="*70)
+    print(f"TOTAL DATASET SUMMARY")
+    print("="*70)
+    print(f"Total images loaded: {len(images)}")
+    print(f"Total classes: {len(class_names)}")
+    print(f"Classes: {class_names}")
+    
+    # Print class distribution
+    label_counts = Counter(labels)
+    print("\nClass distribution:")
+    for idx, class_name in enumerate(class_names):
+        count = label_counts.get(idx, 0)
+        print(f"  {class_name}: {count} images")
     
     return np.array(images), np.array(labels), class_names
 
@@ -43,18 +127,45 @@ def analyze_model():
     print("OVERFITTING ANALYSIS")
     print("="*60)
     
+    # Load class names first (must match training)
+    print("\n0. Loading class names from training...")
+    try:
+        with open(CLASS_NAMES_PATH, 'rb') as f:
+            class_names = pickle.load(f)
+        print(f"   [OK] Loaded {len(class_names)} classes: {class_names}")
+    except Exception as e:
+        print(f"   [ERROR] Could not load class names: {e}")
+        return
+    
     # Load model
     print("\n1. Loading model...")
     try:
         model = keras.models.load_model('asl_model.h5')
         print("   [OK] Model loaded successfully")
     except:
-        print("   [ERROR] Could not load model")
-        return
+        try:
+            model = keras.models.load_model('asl_model.keras')
+            print("   [OK] Model loaded successfully")
+        except Exception as e:
+            print(f"   [ERROR] Could not load model: {e}")
+            return
+    
+    # Verify model output size matches class count
+    try:
+        model_output_size = model.output_shape[-1]
+    except:
+        # Fallback: get from last layer's units
+        model_output_size = model.layers[-1].units if hasattr(model.layers[-1], 'units') else None
+    
+    if model_output_size and model_output_size != len(class_names):
+        print(f"   [WARNING] Model expects {model_output_size} classes but class_names has {len(class_names)}")
+        print(f"   This may cause issues. Please ensure you're using the correct model.")
+    elif model_output_size:
+        print(f"   [OK] Model output size ({model_output_size}) matches class count ({len(class_names)})")
     
     # Load data
     print("\n2. Loading dataset...")
-    images, labels, class_names = load_data(DATA_DIR)
+    images, labels, class_names = load_data(class_names)
     print(f"   [OK] Loaded {len(images)} images")
     
     # Split data (same as training)

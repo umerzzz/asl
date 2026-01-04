@@ -11,11 +11,28 @@ from pathlib import Path
 
 # Configuration
 IMG_SIZE = 64
-MODEL_PATH = 'asl_model.h5'
+MODEL_PATH = 'asl_model.keras'  # Updated to use .keras format (newer format)
 CLASS_NAMES_PATH = 'class_names.pkl'
-DATA_DIR = 'asl'
+BASE_DATA_DIR = 'dataset'
+
+# Define all dataset paths
+DATASET_PATHS = [
+    'dataset/asl',  # Original dataset with lowercase letters
+    'dataset/alphabet and numbers 1',  # First Kaggle dataset
+    'dataset/alphabet and numbers 2',  # Second Kaggle dataset
+    'dataset/asl_alphabet_train/asl_alphabet_train',  # Third Kaggle dataset (nested)
+]
+
 NUM_TEST_SAMPLES = 20  # Number of random samples to test
 NUM_PER_CLASS = 3  # Number of samples per class to show
+
+def normalize_class_name(class_name):
+    """Normalize class names: convert lowercase letters to uppercase, keep special classes as-is"""
+    # If it's a single lowercase letter, convert to uppercase
+    if len(class_name) == 1 and class_name.isalpha() and class_name.islower():
+        return class_name.upper()
+    # Keep numbers and special classes (nothing, space, unknown, del) as-is
+    return class_name
 
 def load_model():
     """Load the trained model"""
@@ -45,27 +62,43 @@ def load_class_names():
         class_names = pickle.load(f)
     return class_names
 
-def load_test_images(data_dir, class_names, num_per_class=3):
-    """Load random test images from each class"""
+def load_test_images(class_names, num_per_class=3):
+    """Load random test images from each class across all datasets"""
     test_images = []
     test_labels = []
     test_paths = []
     
     for class_idx, class_name in enumerate(class_names):
-        class_path = os.path.join(data_dir, class_name)
-        if not os.path.isdir(class_path):
-            continue
+        # Search across all datasets for this class
+        all_image_files = []
         
-        image_files = [f for f in os.listdir(class_path) if f.endswith('.jpeg')]
-        if len(image_files) == 0:
+        for dataset_path in DATASET_PATHS:
+            if not os.path.exists(dataset_path):
+                continue
+            
+            # Try exact match first
+            class_path = os.path.join(dataset_path, class_name)
+            if os.path.isdir(class_path):
+                files = [f for f in os.listdir(class_path) 
+                        if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+                all_image_files.extend([(os.path.join(class_path, f), dataset_path) for f in files])
+            
+            # Try lowercase version if class_name is uppercase letter
+            if class_name.isupper() and len(class_name) == 1:
+                lower_class_path = os.path.join(dataset_path, class_name.lower())
+                if os.path.isdir(lower_class_path):
+                    files = [f for f in os.listdir(lower_class_path) 
+                            if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+                    all_image_files.extend([(os.path.join(lower_class_path, f), dataset_path) for f in files])
+        
+        if len(all_image_files) == 0:
             continue
         
         # Randomly sample images
-        num_samples = min(num_per_class, len(image_files))
-        selected_files = random.sample(image_files, num_samples)
+        num_samples = min(num_per_class, len(all_image_files))
+        selected_files = random.sample(all_image_files, num_samples)
         
-        for img_file in selected_files:
-            img_path = os.path.join(class_path, img_file)
+        for img_path, dataset_path in selected_files:
             img = cv2.imread(img_path)
             
             if img is not None:
@@ -75,7 +108,7 @@ def load_test_images(data_dir, class_names, num_per_class=3):
                 
                 test_images.append(img_normalized)
                 test_labels.append(class_idx)
-                test_paths.append((class_name, img_file))
+                test_paths.append((class_name, os.path.basename(img_path)))
     
     return np.array(test_images), np.array(test_labels), test_paths
 
@@ -252,8 +285,8 @@ def show_confusion_examples(model, test_images, test_labels, test_paths, class_n
         plt.savefig('model_errors.png', dpi=150, bbox_inches='tight')
         print(f"\n[OK] Saved error examples to 'model_errors.png'")
 
-def test_on_full_dataset(model, data_dir, class_names):
-    """Test on a larger sample from the dataset"""
+def test_on_full_dataset(model, class_names):
+    """Test on a larger sample from all datasets"""
     print("\n" + "="*70)
     print("TESTING ON LARGER DATASET SAMPLE")
     print("="*70)
@@ -261,19 +294,38 @@ def test_on_full_dataset(model, data_dir, class_names):
     all_images = []
     all_labels = []
     
-    print("\nLoading images from dataset...")
+    print("\nLoading images from all datasets...")
     for class_idx, class_name in enumerate(class_names):
-        class_path = os.path.join(data_dir, class_name)
-        if not os.path.isdir(class_path):
+        # Search across all datasets for this class
+        all_image_files = []
+        
+        for dataset_path in DATASET_PATHS:
+            if not os.path.exists(dataset_path):
+                continue
+            
+            # Try exact match first
+            class_path = os.path.join(dataset_path, class_name)
+            if os.path.isdir(class_path):
+                files = [f for f in os.listdir(class_path) 
+                        if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+                all_image_files.extend([os.path.join(class_path, f) for f in files])
+            
+            # Try lowercase version if class_name is uppercase letter
+            if class_name.isupper() and len(class_name) == 1:
+                lower_class_path = os.path.join(dataset_path, class_name.lower())
+                if os.path.isdir(lower_class_path):
+                    files = [f for f in os.listdir(lower_class_path) 
+                            if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+                    all_image_files.extend([os.path.join(lower_class_path, f) for f in files])
+        
+        if len(all_image_files) == 0:
             continue
         
-        image_files = [f for f in os.listdir(class_path) if f.endswith('.jpeg')]
         # Sample up to 50 images per class for faster testing
-        num_samples = min(50, len(image_files))
-        selected_files = random.sample(image_files, num_samples) if len(image_files) > num_samples else image_files
+        num_samples = min(50, len(all_image_files))
+        selected_files = random.sample(all_image_files, num_samples) if len(all_image_files) > num_samples else all_image_files
         
-        for img_file in selected_files:
-            img_path = os.path.join(class_path, img_file)
+        for img_path in selected_files:
             img = cv2.imread(img_path)
             
             if img is not None:
@@ -347,7 +399,7 @@ def main():
     print(f"\n{'='*70}")
     print("TEST 1: Visual Verification (Random Samples)")
     print("="*70)
-    test_images, test_labels, test_paths = load_test_images(DATA_DIR, class_names, NUM_PER_CLASS)
+    test_images, test_labels, test_paths = load_test_images(class_names, NUM_PER_CLASS)
     print(f"Loaded {len(test_images)} test images")
     
     predictions, predicted_indices, confidences = predict_and_visualize(
@@ -365,7 +417,7 @@ def main():
     print("TEST 2: Larger Dataset Sample Test")
     print("="*70)
     accuracy, cm, all_images, all_labels, pred_indices, confs = test_on_full_dataset(
-        model, DATA_DIR, class_names
+        model, class_names
     )
     
     # Create confusion matrix visualization

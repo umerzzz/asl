@@ -6,35 +6,23 @@ import pickle
 import pyautogui
 import time
 
-# Try to import MediaPipe with multiple fallback methods
+# Try to import MediaPipe - use tasks API for MediaPipe 0.10+
 MP_AVAILABLE = False
 MP_IMPORT_METHOD = None
-mp_hands_module = None
-mp_drawing_module = None
 
 try:
     import mediapipe as mp
-    # Method 1: Try new tasks API (MediaPipe 0.10+)
+    # Try tasks API (MediaPipe 0.10+)
     try:
-        from mediapipe.tasks.python.vision import hand_landmarker
+        from mediapipe.tasks.python.vision import HandLandmarker, HandLandmarkerOptions
+        from mediapipe.tasks.python.core import base_options
+        from mediapipe import Image, ImageFormat
+        from mediapipe.tasks.python.vision.core import vision_task_running_mode
         MP_AVAILABLE = True
         MP_IMPORT_METHOD = 'tasks'
-    except ImportError:
-        # Method 2: Try classic solutions API
-        try:
-            mp_hands_module = mp.solutions.hands
-            mp_drawing_module = mp.solutions.drawing_utils
-            MP_AVAILABLE = True
-            MP_IMPORT_METHOD = 'solutions'
-        except AttributeError:
-            # Method 3: Try direct import
-            try:
-                from mediapipe.python.solutions import hands as mp_hands_module
-                from mediapipe.python.solutions import drawing_utils as mp_drawing_module
-                MP_AVAILABLE = True
-                MP_IMPORT_METHOD = 'direct'
-            except ImportError:
-                MP_AVAILABLE = False
+    except ImportError as e:
+        print(f"MediaPipe tasks API not available: {e}")
+        MP_AVAILABLE = False
 except ImportError:
     MP_AVAILABLE = False
 
@@ -42,11 +30,17 @@ except ImportError:
 IMG_SIZE = 64
 MODEL_PATH = 'asl_model.keras'
 CLASS_NAMES_PATH = 'class_names.pkl'
-CONFIDENCE_THRESHOLD = 0.90  # Higher threshold for accuracy
-PREDICTION_DELAY = 0.5  # Slower predictions for stability
-STABLE_PREDICTIONS_NEEDED = 6  # More consistent predictions needed
-MIN_TIME_BETWEEN_TYPING = 3.0  # Minimum 3 seconds between typing same character
-MIN_TIME_BETWEEN_ANY_TYPING = 1.5  # Minimum time between any typing
+CONFIDENCE_THRESHOLD = 0.70  # Lower threshold for faster response
+FILTER_UNKNOWN = True  # Filter out "unknown" predictions unless very confident
+UNKNOWN_THRESHOLD = 0.95  # Only accept "unknown" if confidence is very high (increased from 0.90)
+PREDICTION_DELAY = 0.1  # Much faster for real-time (was 0.2)
+STABLE_PREDICTIONS_NEEDED = 3  # Fewer needed for faster response (was 5)
+MIN_TIME_BETWEEN_TYPING = 1.0  # Faster typing response
+MIN_TIME_BETWEEN_ANY_TYPING = 0.5  # Much faster
+USE_ENSEMBLE = False  # Disable ensemble for speed (was True)
+CONFIDENCE_SMOOTHING_WINDOW = 3  # Smaller window for faster response
+DEBUG_MODE = True  # Set to True to see ROI being sent to model
+SAVE_ROI_DEBUG = True  # Set to True to save ROI images for debugging
 
 class ASLRealTimePredictor:
     def __init__(self):
@@ -71,32 +65,48 @@ class ASLRealTimePredictor:
         
         print(f"Model loaded successfully! Classes: {self.class_names}")
         
-        # Initialize hand detection
-        self.use_mediapipe = False
-        if MP_AVAILABLE and MP_IMPORT_METHOD == 'solutions':
-            print("Initializing MediaPipe hand detection...")
+        # Initialize hand detection - REQUIRE MediaPipe (no fallback)
+        if not MP_AVAILABLE:
+            raise RuntimeError(
+                "MediaPipe is required but not available. Please install it with: pip install mediapipe\n"
+                "Or if using MediaPipe 0.10+, ensure the tasks API is available."
+            )
+        
+        print("Initializing MediaPipe hand detection...")
+        if MP_IMPORT_METHOD == 'tasks':
             try:
-                self.mp_hands = mp_hands_module
-                self.mp_drawing = mp_drawing_module
-                self.hands = self.mp_hands.Hands(
-                    static_image_mode=False,
-                    max_num_hands=1,
-                    min_detection_confidence=0.7,
-                    min_tracking_confidence=0.5
+                # Use tasks API (MediaPipe 0.10+)
+                # Download model automatically from URL if not available locally
+                import os
+                model_path = os.path.join(os.path.dirname(__file__), 'hand_landmarker.task')
+                model_url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+                
+                if not os.path.exists(model_path):
+                    print("Downloading hand landmarker model...")
+                    import urllib.request
+                    urllib.request.urlretrieve(model_url, model_path)
+                    print("Model downloaded successfully!")
+                
+                # Create options - Lower thresholds for better detection
+                options = HandLandmarkerOptions(
+                    base_options=base_options.BaseOptions(model_asset_path=model_path),
+                    running_mode=vision_task_running_mode.VisionTaskRunningMode.VIDEO,
+                    num_hands=1,
+                    min_hand_detection_confidence=0.3,  # Lowered from 0.5 for better detection
+                    min_hand_presence_confidence=0.3,  # Lowered from 0.5 for better detection
+                    min_tracking_confidence=0.3  # Lowered from 0.5 for better tracking
                 )
+                
+                # Create HandLandmarker
+                self.hand_landmarker = HandLandmarker.create_from_options(options)
                 self.use_mediapipe = True
-                print("MediaPipe hand detection ready!")
+                self.mp_import_method = 'tasks'
+                print("MediaPipe hand detection ready! (tasks API)")
             except Exception as e:
-                print(f"Warning: Could not initialize MediaPipe: {e}")
-                print("Falling back to improved color-based detection...")
-                self.setup_color_detection()
+                raise RuntimeError(f"Failed to initialize MediaPipe HandLandmarker: {e}\n"
+                                 "Please ensure MediaPipe is properly installed: pip install mediapipe")
         else:
-            if not MP_AVAILABLE:
-                print("MediaPipe not installed. Using improved color-based detection...")
-            else:
-                print(f"MediaPipe available but using {MP_IMPORT_METHOD} API (not yet implemented).")
-                print("Falling back to improved color-based detection...")
-            self.setup_color_detection()
+            raise RuntimeError(f"Unsupported MediaPipe import method: {MP_IMPORT_METHOD}")
         
         # Initialize camera
         self.cap = cv2.VideoCapture(0)
@@ -113,183 +123,143 @@ class ASLRealTimePredictor:
         self.last_typed_time = 0
         self.stable_prediction_count = 0
         self.current_stable_char = None
-    
-    def setup_color_detection(self):
-        """Setup color-based hand detection as fallback"""
-        self.lower_skin1 = np.array([0, 20, 70], dtype=np.uint8)
-        self.upper_skin1 = np.array([20, 255, 255], dtype=np.uint8)
-        self.lower_skin2 = np.array([170, 20, 70], dtype=np.uint8)
-        self.upper_skin2 = np.array([180, 255, 255], dtype=np.uint8)
-    
-    def detect_hand_color_based(self, frame):
-        """Improved color-based hand detection with center focus"""
-        h, w = frame.shape[:2]
+        self.frame_timestamp_ms = 0  # For MediaPipe video detection
+        self.confidence_history = []  # Store confidence scores for smoothing
         
-        # Focus on center region (where hands are typically positioned)
-        center_region_ratio = 0.6  # Use 60% of frame centered
-        center_x_start = int(w * (1 - center_region_ratio) / 2)
-        center_y_start = int(h * (1 - center_region_ratio) / 2)
-        center_x_end = int(w * (1 + center_region_ratio) / 2)
-        center_y_end = int(h * (1 + center_region_ratio) / 2)
-        
-        # Extract center region for processing
-        center_region = frame[center_y_start:center_y_end, center_x_start:center_x_end].copy()
-        
-        if center_region.size == 0:
-            # Fallback to full frame
-            center_region = frame.copy()
-            center_x_start = center_y_start = 0
-        
-        hsv = cv2.cvtColor(center_region, cv2.COLOR_BGR2HSV)
-        mask1 = cv2.inRange(hsv, self.lower_skin1, self.upper_skin1)
-        mask2 = cv2.inRange(hsv, self.lower_skin2, self.upper_skin2)
-        mask = cv2.bitwise_or(mask1, mask2)
-        
-        # More aggressive morphological operations
-        kernel_small = np.ones((3, 3), np.uint8)
-        kernel_large = np.ones((7, 7), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_small)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_large)
-        
-        # Remove small noise
-        mask = cv2.erode(mask, kernel_small, iterations=1)
-        mask = cv2.dilate(mask, kernel_large, iterations=2)
-        
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if contours:
-            hand_candidates = []
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                # More restrictive size range for hands
-                if 5000 < area < 40000:  # Hand-sized objects
-                    x, y, w_rect, h_rect = cv2.boundingRect(contour)
-                    
-                    # Adjust coordinates to full frame
-                    x += center_x_start
-                    y += center_y_start
-                    
-                    aspect_ratio = float(w_rect) / h_rect if h_rect > 0 else 0
-                    frame_h, frame_w = frame.shape[:2]
-                    center_y_ratio = (y + h_rect // 2) / frame_h
-                    center_x_ratio = (x + w_rect // 2) / frame_w
-                    
-                    # Strict filtering: hands are in center area, roughly square
-                    if (0.6 < aspect_ratio < 1.4 and  # More square
-                        0.25 < center_y_ratio < 0.75 and  # Center vertical area
-                        0.2 < center_x_ratio < 0.8):  # Center horizontal area
-                        
-                        # Check for convexity defects (fingers)
-                        score = 0.5
-                        try:
-                            hull = cv2.convexHull(contour, returnPoints=False)
-                            if len(hull) > 3:
-                                defects = cv2.convexityDefects(contour, hull)
-                                if defects is not None:
-                                    defect_count = len(defects)
-                                    if defect_count >= 3:  # Has finger-like features
-                                        score = 1.0
-                                    elif defect_count >= 1:
-                                        score = 0.7
-                        except:
-                            pass
-                        
-                        # Bonus for being in ideal center position
-                        if 0.35 < center_y_ratio < 0.65 and 0.3 < center_x_ratio < 0.7:
-                            score += 0.2
-                        
-                        # Bonus for good aspect ratio (close to square)
-                        if 0.8 < aspect_ratio < 1.2:
-                            score += 0.1
-                        
-                        hand_candidates.append((contour, area, score, x, y, w_rect, h_rect))
-            
-            if hand_candidates:
-                # Sort by score, then by proximity to center
-                hand_candidates.sort(key=lambda x: (x[2], -abs(x[3] + x[5]//2 - w//2) - abs(x[4] + x[6]//2 - h//2)), reverse=True)
-                best_contour, _, _, x, y, w_rect, h_rect = hand_candidates[0]
-                
-                padding = 40
-                x = max(0, x - padding)
-                y = max(0, y - padding)
-                w_rect = min(frame.shape[1] - x, w_rect + 2 * padding)
-                h_rect = min(frame.shape[0] - y, h_rect + 2 * padding)
-                
-                # Make it square
-                size = max(w_rect, h_rect)
-                center_x = x + w_rect // 2
-                center_y = y + h_rect // 2
-                x = max(0, center_x - size // 2)
-                y = max(0, center_y - size // 2)
-                w_rect = h_rect = min(size, min(frame.shape[1] - x, frame.shape[0] - y))
-                
-                if w_rect > 100 and h_rect > 100:  # Minimum size increased
-                    return x, y, w_rect, h_rect, True, None
-        
-        # Fallback to center crop (preferred region)
-        h, w = frame.shape[:2]
-        roi_size = min(w, h) * 0.55  # Slightly smaller, more focused
-        x = int((w - roi_size) / 2)
-        y = int((h - roi_size) / 2)
-        return x, y, int(roi_size), int(roi_size), False, None
+        # Optimize model for inference speed
+        try:
+            # Enable optimizations for faster inference
+            tf.config.optimizer.set_jit(True)  # Enable XLA JIT compilation
+        except:
+            pass  # XLA not available, continue without it
     
     def detect_hand_region(self, frame):
-        """Detect hand region using MediaPipe or fallback"""
-        if self.use_mediapipe:
-            # Use MediaPipe
+        """Detect hand region using MediaPipe (REQUIRED - no fallback)"""
+        h, w = frame.shape[:2]
+        
+        if not self.use_mediapipe:
+            raise RuntimeError("MediaPipe is required but not initialized")
+        
+        # Use MediaPipe tasks API for hand detection
+        if self.mp_import_method == 'tasks':
+            # Convert BGR to RGB for MediaPipe
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            rgb_frame.flags.writeable = False
-            results = self.hands.process(rgb_frame)
-            rgb_frame.flags.writeable = True
             
-            if results.multi_hand_landmarks:
-                hand_landmarks = results.multi_hand_landmarks[0]
-                h, w = frame.shape[:2]
-                x_coords = [landmark.x * w for landmark in hand_landmarks.landmark]
-                y_coords = [landmark.y * h for landmark in hand_landmarks.landmark]
+            # Create MediaPipe Image
+            mp_image = Image(image_format=ImageFormat.SRGB, data=rgb_frame)
+            
+            # Detect hand landmarks (timestamp in milliseconds)
+            self.frame_timestamp_ms += 33  # ~30 FPS = 33ms per frame
+            try:
+                result = self.hand_landmarker.detect_for_video(mp_image, self.frame_timestamp_ms)
+            except Exception as e:
+                if DEBUG_MODE:
+                    print(f"⚠ MediaPipe detection error: {e}")
+                result = None
+            
+            if result and result.hand_landmarks and len(result.hand_landmarks) > 0:
+                hand_landmarks = result.hand_landmarks[0]
+                x_coords = [landmark.x * w for landmark in hand_landmarks]
+                y_coords = [landmark.y * h for landmark in hand_landmarks]
                 
                 x_min, x_max = int(min(x_coords)), int(max(x_coords))
                 y_min, y_max = int(min(y_coords)), int(max(y_coords))
                 
-                padding = 40
-                x_min = max(0, x_min - padding)
-                y_min = max(0, y_min - padding)
-                x_max = min(w, x_max + padding)
-                y_max = min(h, y_max + padding)
+                # Calculate hand bounding box
+                hand_width = x_max - x_min
+                hand_height = y_max - y_min
+                hand_center_x = (x_min + x_max) // 2
+                hand_center_y = (y_min + y_max) // 2
                 
-                width = x_max - x_min
-                height = y_max - y_min
-                size = max(width, height)
+                # CRITICAL: Match training data format - hand should fill ~20% of 224x224 image
+                # Training images: 224x224 with hand taking ~21% of image area
+                # Problem: 400x400 ROI includes too much background, hand becomes too small when resized
+                # Solution: Extract smaller ROI so hand fills appropriate portion
+                hand_max_dimension = max(hand_width, hand_height)
                 
-                center_x = (x_min + x_max) // 2
-                center_y = (y_min + y_max) // 2
+                # Calculate ROI size: hand should be ~20-25% of ROI area
+                # If hand is 100px, we want ROI where hand is ~20% = sqrt(100/0.2) ≈ 224px
+                # Use 2.0-2.5x hand size to get proper hand-to-background ratio
+                # This ensures hand fills ~16-25% of ROI (matching training ~21%)
+                target_roi_size = int(hand_max_dimension * 2.2)  # 2.2x gives ~20% hand coverage
                 
-                x = max(0, center_x - size // 2)
-                y = max(0, center_y - size // 2)
-                x_max = min(w, x + size)
-                y_max = min(h, y + size)
+                # Clamp to reasonable range: 224-280px (not too large!)
+                # Training images are 224x224, so we want similar size
+                target_roi_size = max(224, min(280, target_roi_size))
+                target_roi_size = min(target_roi_size, min(w, h))  # Don't exceed frame
                 
-                if x_max - x < size:
-                    x = max(0, x_max - size)
-                if y_max - y < size:
-                    y = max(0, y_max - size)
+                # Center ROI on hand center
+                x = max(0, hand_center_x - target_roi_size // 2)
+                y = max(0, hand_center_y - target_roi_size // 2)
                 
-                w_roi = x_max - x
-                h_roi = y_max - y
+                # Adjust if we hit frame boundaries
+                if x + target_roi_size > w:
+                    x = w - target_roi_size
+                if y + target_roi_size > h:
+                    y = h - target_roi_size
+                x = max(0, x)
+                y = max(0, y)
                 
-                if w_roi > 80 and h_roi > 80:
+                # Final ROI (must be square)
+                w_roi = min(target_roi_size, w - x)
+                h_roi = min(target_roi_size, h - y)
+                final_size = min(w_roi, h_roi)
+                
+                # Re-center to ensure perfect square while keeping hand centered
+                ideal_x = hand_center_x - final_size // 2
+                ideal_y = hand_center_y - final_size // 2
+                
+                # Clamp ideal position to frame bounds
+                x = max(0, min(ideal_x, w - final_size))
+                y = max(0, min(ideal_y, h - final_size))
+                
+                w_roi = h_roi = final_size
+                
+                # Accept ROI if it's at least 200px (will be resized to 224x224 later)
+                if w_roi >= 200 and h_roi >= 200:
+                    if DEBUG_MODE:
+                        print(f"✓ Hand detected! ROI: {w_roi}x{h_roi} @ ({x},{y})")
                     return x, y, w_roi, h_roi, True, hand_landmarks
-            
-            return self.detect_hand_color_based(frame)
+                else:
+                    if DEBUG_MODE:
+                        print(f"⚠ Hand detected but ROI size too small: {w_roi}x{h_roi} (need >= 224px)")
+        
+        # No hand detected - return center crop matching training size exactly
+        # Training data: original images (any size) resized directly to 64x64
+        # Use 224x224 center crop for consistency (will be resized to 64x64 in preprocessing)
+        target_size = 224
+        # For 640x480 frames, use exactly 224px
+        if min(w, h) >= 224:
+            roi_size = 224
         else:
-            # Use color-based detection
-            return self.detect_hand_color_based(frame)
+            # For smaller frames, use as much as possible
+            roi_size = min(w, h)
+        roi_size = min(roi_size, min(w, h))  # Don't exceed frame size
+        x = int((w - roi_size) / 2)
+        y = int((h - roi_size) / 2)
+        if DEBUG_MODE:
+            print(f"⚠ No hand detected - using center crop: {roi_size}x{roi_size} @ ({x},{y})")
+        return x, y, roi_size, roi_size, False, None
     
     def preprocess_frame(self, frame):
-        """Preprocess frame for model prediction"""
-        resized = cv2.resize(frame, (IMG_SIZE, IMG_SIZE))
-        resized_rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        normalized = resized_rgb.astype('float32') / 255.0
+        """Preprocess frame for model prediction - EXACTLY as training"""
+        # IMPORTANT: Keep BGR format to match training (cv2.imread uses BGR)
+        # Do NOT convert to RGB - training uses BGR format
+        
+        # Handle empty or invalid ROI
+        if frame.size == 0 or frame.shape[0] == 0 or frame.shape[1] == 0:
+            # Return black image if ROI is invalid
+            black_img = np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.float32)
+            return np.expand_dims(black_img, axis=0)
+        
+        # Training data: 224x224 square images resized to 64x64
+        # ROI should already be square at this point
+        # Resize using same method as training (INTER_AREA is good for downscaling)
+        resized = cv2.resize(frame, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
+        
+        # Normalize exactly as training
+        normalized = resized.astype('float32') / 255.0
+        
         return np.expand_dims(normalized, axis=0)
     
     def predict(self, frame):
@@ -304,6 +274,43 @@ class ASLRealTimePredictor:
         top3_predictions = [(self.class_names[i], predictions[0][i]) for i in top3_indices]
         
         return predicted_class, confidence, top3_predictions
+    
+    def predict_ensemble(self, frames):
+        """Predict using ensemble of multiple frames - OPTIMIZED with batch prediction"""
+        if not frames or len(frames) == 0:
+            return None, 0.0, []
+        
+        # Batch preprocess all frames at once (much faster)
+        preprocessed_batch = []
+        for frame in frames:
+            preprocessed = self.preprocess_frame(frame)
+            preprocessed_batch.append(preprocessed[0])  # Remove batch dimension
+        
+        # Batch predict all frames at once (single model call instead of N calls)
+        batch_input = np.array(preprocessed_batch)
+        all_predictions = self.model.predict(batch_input, verbose=0)
+        
+        # Average predictions across frames
+        ensemble_pred = np.mean(all_predictions, axis=0)
+        
+        # Get final prediction from ensemble
+        confidence = np.max(ensemble_pred)
+        predicted_class_idx = np.argmax(ensemble_pred)
+        predicted_class = self.class_names[predicted_class_idx]
+        
+        top3_indices = np.argsort(ensemble_pred)[-3:][::-1]
+        top3_predictions = [(self.class_names[i], ensemble_pred[i]) for i in top3_indices]
+        
+        return predicted_class, confidence, top3_predictions
+    
+    def is_number(self, char):
+        """Check if character is a number"""
+        return char in ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']
+    
+    def is_letter(self, char):
+        """Check if character is a letter"""
+        return char in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 
+                       'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z']
     
     def type_character(self, character):
         """Type the predicted character"""
@@ -325,14 +332,15 @@ class ASLRealTimePredictor:
         cv2.rectangle(overlay, (0, 0), (w_frame, status_bar_height), (20, 20, 20), -1)
         frame = cv2.addWeighted(overlay, 0.7, frame, 0.3, 0)
         
-        # Draw hand landmarks if using MediaPipe
-        if hand_landmarks and self.use_mediapipe:
+        # Draw hand landmarks if using MediaPipe (tasks API doesn't have drawing utils in the same way)
+        # We'll draw basic landmarks manually if needed
+        if hand_landmarks and self.use_mediapipe and self.mp_import_method == 'tasks':
             try:
-                self.mp_drawing.draw_landmarks(
-                    frame, hand_landmarks, self.mp_hands.HAND_CONNECTIONS,
-                    self.mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2, circle_radius=2),
-                    self.mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=2)
-                )
+                # Draw hand landmarks as circles (use different variable names to avoid shadowing ROI x,y)
+                for landmark in hand_landmarks:
+                    lm_x = int(landmark.x * w_frame)
+                    lm_y = int(landmark.y * h_frame)
+                    cv2.circle(frame, (lm_x, lm_y), 3, (0, 255, 0), -1)
             except:
                 pass
         
@@ -353,9 +361,8 @@ class ASLRealTimePredictor:
         cv2.line(frame, (x + w, y + h), (x + w, y + h - corner_size), color, thickness)
         
         # Status text
-        detection_method = "MediaPipe" if self.use_mediapipe else "Color-based"
         if hand_detected:
-            status_text = f"✓ HAND DETECTED ({detection_method})"
+            status_text = "✓ HAND DETECTED (MediaPipe)"
         else:
             status_text = "⚠ NO HAND - Position hand in CENTER"
         cv2.putText(frame, status_text, (x, y - 10), 
@@ -431,18 +438,36 @@ class ASLRealTimePredictor:
             cv2.putText(frame, stable_text, (10, stable_y), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, stable_color, 2)
         
-        # Model preview
+        # Model preview (shows what's being sent to model)
         preview_size = 128
         preview_x = w_frame - preview_size - 10
         preview_y = h_frame - preview_size - 10
         
+        # Show the actual preprocessed image that goes to model
+        if hand_roi_img.size > 0:
+            # Resize ROI to show what model sees
+            model_input_preview = cv2.resize(hand_roi_img, (IMG_SIZE, IMG_SIZE))
+            model_input_preview = cv2.resize(model_input_preview, (preview_size, preview_size), interpolation=cv2.INTER_NEAREST)
+        else:
+            model_input_preview = np.zeros((preview_size, preview_size, 3), dtype=np.uint8)
+        
         preview_frame = np.zeros((preview_size + 20, preview_size + 20, 3), dtype=np.uint8)
-        preview_frame[10:10+preview_size, 10:10+preview_size] = cv2.resize(hand_roi_img, (preview_size, preview_size))
+        preview_frame[10:10+preview_size, 10:10+preview_size] = model_input_preview
         cv2.rectangle(preview_frame, (5, 5), (preview_size + 15, preview_size + 15), (255, 255, 255), 2)
         cv2.putText(preview_frame, "MODEL INPUT", (15, preview_size + 18), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         
         frame[preview_y-10:preview_y+preview_size+10, preview_x-10:preview_x+preview_size+10] = preview_frame
+        
+        # Debug: Show ROI info and hand detection status
+        if DEBUG_MODE:
+            debug_text = f"ROI: {w}x{h} @ ({x},{y}) | Hand: {'YES' if hand_detected else 'NO'}"
+            cv2.putText(frame, debug_text, (10, h_frame - 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            # Show MediaPipe status
+            mp_status = "MediaPipe: ACTIVE" if self.use_mediapipe else "MediaPipe: INACTIVE"
+            cv2.putText(frame, mp_status, (10, h_frame - 50), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
         
         # Typed text display
         text_y = h_frame - 60
@@ -468,10 +493,9 @@ class ASLRealTimePredictor:
     
     def run(self):
         """Run real-time prediction loop"""
-        method = "MediaPipe" if self.use_mediapipe else "Color-based"
         print("\n" + "="*70)
         print(f"ASL REAL-TIME RECOGNITION - AUTO TYPING MODE")
-        print(f"Using {method} hand detection")
+        print(f"Using MediaPipe hand detection")
         print("="*70)
         print("Instructions:")
         print("  - Position your hand in the center of the camera")
@@ -491,26 +515,115 @@ class ASLRealTimePredictor:
             frame = cv2.flip(frame, 1)
             
             x, y, w, h, hand_detected, hand_landmarks = self.detect_hand_region(frame)
+            
+            # Ensure valid ROI bounds
+            x = max(0, min(x, frame.shape[1] - 1))
+            y = max(0, min(y, frame.shape[0] - 1))
+            w = max(1, min(w, frame.shape[1] - x))
+            h = max(1, min(h, frame.shape[0] - y))
+            
+            # Extract ROI
             roi = frame[y:y+h, x:x+w].copy() if w > 0 and h > 0 else frame.copy()
+            
+            # Training data: 224x224 square images resized to 64x64
+            # Ensure ROI is square to match training format
+            if roi.size > 0:
+                h_roi, w_roi = roi.shape[:2]
+                if h_roi != w_roi:
+                    # Make square by cropping to center (training uses square images)
+                    size = min(h_roi, w_roi)
+                    y_start = (h_roi - size) // 2
+                    x_start = (w_roi - size) // 2
+                    roi = roi[y_start:y_start+size, x_start:x_start+size]
+                    w = h = size
+            
             hand_roi_img = roi.copy()
             
-            if roi.size > 0 and w > 50 and h > 50:
+            # Only make predictions if ROI is valid and size is at least 200px
+            # Training data: 224x224 images resized directly to 64x64
+            # We extract ROI with padding (200-400px), resize to 224x224, then to 64x64 in preprocessing
+            if roi.size > 0 and w >= 200 and h >= 200:
+                # ALWAYS resize ROI to 224x224 to match training data format exactly
+                # This standardizes the size regardless of original ROI size (200-400px)
+                roi = cv2.resize(roi, (224, 224), interpolation=cv2.INTER_AREA)
+                w = h = 224
                 current_time = time.time()
                 if current_time - self.last_prediction_time >= PREDICTION_DELAY:
+                    # Fast single-frame prediction (ensemble disabled for speed)
                     predicted_class, confidence, top3 = self.predict(roi)
                     
-                    self.prediction_history.append((predicted_class, confidence))
-                    if len(self.prediction_history) > 10:
-                        self.prediction_history.pop(0)
+                    # Light confidence smoothing (smaller window for speed)
+                    self.confidence_history.append(confidence)
+                    if len(self.confidence_history) > CONFIDENCE_SMOOTHING_WINDOW:
+                        self.confidence_history.pop(0)
+                    smoothed_confidence = np.mean(self.confidence_history)
                     
-                    # Only process if hand is detected AND confidence is high
-                    if hand_detected and confidence >= CONFIDENCE_THRESHOLD:
-                        recent_predictions = [p[0] for p in self.prediction_history[-STABLE_PREDICTIONS_NEEDED:]]
+                    # Use smoothed confidence for filtering
+                    confidence = smoothed_confidence
+                    
+                    # Debug: Save ROI if enabled (save the actual ROI before preprocessing)
+                    if SAVE_ROI_DEBUG and confidence > 0.5:
+                        import os
+                        os.makedirs('debug_rois', exist_ok=True)
+                        # Save the original ROI (hand_roi_img) not the preprocessed one
+                        # Ensure it's in uint8 format
+                        if hand_roi_img.dtype != np.uint8:
+                            roi_to_save = (hand_roi_img * 255).astype(np.uint8) if hand_roi_img.dtype == np.float32 else hand_roi_img.astype(np.uint8)
+                        else:
+                            roi_to_save = hand_roi_img.copy()
+                        # Resize to 224x224 if needed for consistency
+                        if roi_to_save.shape[0] != 224 or roi_to_save.shape[1] != 224:
+                            roi_to_save = cv2.resize(roi_to_save, (224, 224), interpolation=cv2.INTER_AREA)
+                        cv2.imwrite(f'debug_rois/{predicted_class}_{confidence:.2f}_{int(time.time()*1000)}.jpg', roi_to_save)
+                    
+                    # Filter predictions
+                    roi_size_valid = 200 <= w <= 250 and 200 <= h <= 250
+                    is_ambiguous = False
+                    
+                    # Check for number/letter confusion - require higher confidence
+                    if len(top3) >= 2:
+                        top1_class, top1_conf = top3[0]
+                        top2_class, top2_conf = top3[1]
+                        
+                        # If confusing between number and letter, require higher confidence
+                        if ((self.is_number(top1_class) and self.is_letter(top2_class)) or 
+                            (self.is_letter(top1_class) and self.is_number(top2_class))):
+                            # If confidences are close (within 15%), require higher threshold
+                            if abs(top1_conf - top2_conf) < 0.15:
+                                # Require higher confidence for ambiguous cases
+                                if confidence < 0.80:
+                                    is_ambiguous = True
+                    
+                    if not roi_size_valid:
+                        # ROI size is wrong - skip this prediction
+                        pass
+                    elif is_ambiguous:
+                        # Too ambiguous between number/letter - skip
+                        pass
+                    elif FILTER_UNKNOWN and predicted_class == 'unknown' and confidence < UNKNOWN_THRESHOLD:
+                        # Skip unknown predictions unless very confident
+                        pass
+                    elif confidence >= CONFIDENCE_THRESHOLD:
+                        # Valid prediction - add to history
+                        self.prediction_history.append((predicted_class, confidence))
+                        if len(self.prediction_history) > 10:  # Smaller history for speed
+                            self.prediction_history.pop(0)
+                        # Use longer history window for more stable predictions
+                        window_size = max(STABLE_PREDICTIONS_NEEDED, len(self.prediction_history))
+                        recent_predictions = [p[0] for p in self.prediction_history[-window_size:]]
+                        recent_confidences = [p[1] for p in self.prediction_history[-window_size:]]
+                        
                         if len(recent_predictions) >= STABLE_PREDICTIONS_NEEDED:
+                            # Find most common prediction
                             most_common = max(set(recent_predictions), key=recent_predictions.count)
                             count = recent_predictions.count(most_common)
                             
-                            if count >= STABLE_PREDICTIONS_NEEDED:
+                            # Calculate average confidence for most common prediction
+                            most_common_confidences = [conf for pred, conf in zip(recent_predictions, recent_confidences) if pred == most_common]
+                            avg_confidence = np.mean(most_common_confidences) if most_common_confidences else confidence
+                            
+                            # Require both stability (count) and confidence
+                            if count >= STABLE_PREDICTIONS_NEEDED and avg_confidence >= CONFIDENCE_THRESHOLD:
                                 if most_common != self.current_stable_char:
                                     self.current_stable_char = most_common
                                     self.stable_prediction_count = count
@@ -522,8 +635,7 @@ class ASLRealTimePredictor:
                                 # 1. Hand is actually detected (not using center region)
                                 # 2. Either different character OR enough time passed for same character  
                                 # 3. Minimum time between any typing
-                                if (hand_detected and 
-                                    (most_common != self.last_typed_char or time_since_last_type > MIN_TIME_BETWEEN_TYPING) and
+                                if ((most_common != self.last_typed_char or time_since_last_type > MIN_TIME_BETWEEN_TYPING) and
                                     time_since_last_type >= MIN_TIME_BETWEEN_ANY_TYPING):
                                     if self.type_character(most_common):
                                         self.current_text += most_common
@@ -531,7 +643,9 @@ class ASLRealTimePredictor:
                                         self.last_typed_time = current_time
                                         self.prediction_history = []  # Clear after typing
                                         self.current_stable_char = None
-                                        print(f"  → Typed '{most_common}' (confidence: {confidence:.2%}, stable: {count}/{STABLE_PREDICTIONS_NEEDED})")
+                                        print(f"  → Typed '{most_common}' (confidence: {avg_confidence:.2%}, stable: {count}/{STABLE_PREDICTIONS_NEEDED})")
+                                        # Clear confidence history after successful prediction
+                                        self.confidence_history = []
                             else:
                                 self.current_stable_char = None
                         else:
@@ -572,9 +686,9 @@ class ASLRealTimePredictor:
                 self.type_character(" ")
         
         self.cap.release()
-        if self.use_mediapipe:
+        if self.use_mediapipe and self.mp_import_method == 'tasks':
             try:
-                self.hands.close()
+                self.hand_landmarker.close()
             except:
                 pass
         cv2.destroyAllWindows()

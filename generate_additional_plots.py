@@ -7,41 +7,134 @@ import cv2
 import os
 from sklearn.metrics import confusion_matrix
 from sklearn.model_selection import train_test_split
+from collections import Counter
 
 # Configuration
 IMG_SIZE = 64
 BATCH_SIZE = 32
-DATA_DIR = 'asl'
+BASE_DATA_DIR = 'dataset'
+
+# Define all dataset paths
+DATASET_PATHS = [
+    'dataset/asl',  # Original dataset with lowercase letters
+    'dataset/alphabet and numbers 1',  # First Kaggle dataset
+    'dataset/alphabet and numbers 2',  # Second Kaggle dataset
+    'dataset/asl_alphabet_train/asl_alphabet_train',  # Third Kaggle dataset (nested)
+]
+
 MODEL_PATH = 'asl_model.h5'
 CLASS_NAMES_PATH = 'class_names.pkl'
 OUTPUT_DIR = 'model_metrics'
 
-def load_data(data_dir):
-    """Load images and labels"""
-    images = []
-    labels = []
-    class_names = []
+def normalize_class_name(class_name):
+    """Normalize class names: convert lowercase letters to uppercase, keep special classes as-is"""
+    # If it's a single lowercase letter, convert to uppercase
+    if len(class_name) == 1 and class_name.isalpha() and class_name.islower():
+        return class_name.upper()
+    # Keep numbers and special classes (nothing, space, unknown, del) as-is
+    return class_name
+
+def load_data_from_directory(dataset_path, class_mapping, images, labels):
+    """Load images from a single dataset directory"""
+    if not os.path.exists(dataset_path):
+        print(f"  [SKIP] Dataset path not found: {dataset_path}")
+        return
     
-    classes = sorted([d for d in os.listdir(data_dir) 
-                     if os.path.isdir(os.path.join(data_dir, d)) and d != 'asl'])
+    print(f"  Loading from: {dataset_path}")
     
-    for idx, class_name in enumerate(classes):
-        class_path = os.path.join(data_dir, class_name)
-        image_files = [f for f in os.listdir(class_path) if f.endswith('.jpeg')]
+    # Get all class directories
+    if not os.path.isdir(dataset_path):
+        return
+    
+    classes = [d for d in os.listdir(dataset_path) 
+               if os.path.isdir(os.path.join(dataset_path, d))]
+    
+    # Exclude nested 'asl' folder if it exists
+    if 'asl' in classes and os.path.isdir(os.path.join(dataset_path, 'asl')):
+        # Check if 'asl' folder contains more folders (it's a nested structure)
+        asl_path = os.path.join(dataset_path, 'asl')
+        nested_classes = [d for d in os.listdir(asl_path) 
+                         if os.path.isdir(os.path.join(asl_path, d))]
+        if nested_classes:
+            # Skip the 'asl' folder, it's just a container
+            classes = [c for c in classes if c != 'asl']
+    
+    for class_name in classes:
+        class_path = os.path.join(dataset_path, class_name)
+        if not os.path.isdir(class_path):
+            continue
         
+        # Normalize class name
+        normalized_name = normalize_class_name(class_name)
+        
+        # Get or create class index
+        if normalized_name not in class_mapping:
+            class_mapping[normalized_name] = len(class_mapping)
+        
+        class_idx = class_mapping[normalized_name]
+        
+        # Load images (support both .jpg and .jpeg)
+        image_files = [f for f in os.listdir(class_path) 
+                      if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        
+        loaded_count = 0
         for img_file in image_files:
             img_path = os.path.join(class_path, img_file)
             img = cv2.imread(img_path)
             
             if img is not None:
+                # Resize and normalize
                 img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
                 img = img.astype('float32') / 255.0
                 images.append(img)
-                labels.append(idx)
+                labels.append(class_idx)
+                loaded_count += 1
         
-        class_names.append(class_name)
+        if loaded_count > 0:
+            print(f"    Class '{class_name}' -> '{normalized_name}': {loaded_count} images")
+
+def load_data():
+    """Load images and labels from all dataset directories"""
+    images = []
+    labels = []
+    class_mapping = {}  # Maps normalized class name to index
     
-    return np.array(images), np.array(labels), class_names
+    print("="*70)
+    print("LOADING DATA FROM MULTIPLE DATASETS")
+    print("="*70)
+    
+    # Load from all dataset paths
+    for dataset_path in DATASET_PATHS:
+        load_data_from_directory(dataset_path, class_mapping, images, labels)
+    
+    # Create sorted class names list
+    class_names = sorted(class_mapping.keys(), key=lambda x: (
+        # Sort: numbers first (0-9), then letters (A-Z), then special classes
+        (0, int(x)) if x.isdigit() else (1, x) if x.isalpha() else (2, x)
+    ))
+    
+    # Create reverse mapping: old_index -> normalized_name -> new_index
+    old_to_name = {idx: name for name, idx in class_mapping.items()}
+    name_to_new = {name: idx for idx, name in enumerate(class_names)}
+    
+    # Remap labels to sorted indices
+    labels_remapped = [name_to_new[old_to_name[label]] for label in labels]
+    
+    print("\n" + "="*70)
+    print(f"TOTAL DATASET SUMMARY")
+    print("="*70)
+    print(f"Total images loaded: {len(images)}")
+    print(f"Total classes: {len(class_names)}")
+    print(f"Classes: {class_names}")
+    
+    # Print class distribution
+    label_counts = Counter(labels_remapped)
+    print("\nClass distribution:")
+    for idx, class_name in enumerate(class_names):
+        count = label_counts.get(idx, 0)
+        print(f"  {class_name}: {count} images")
+    
+    return np.array(images), np.array(labels_remapped), class_names
 
 def plot_confidence_distribution(model, X_val, y_val, class_names):
     """Plot confidence score distribution"""
@@ -236,7 +329,7 @@ def main():
     
     # Load data
     print("\nLoading dataset...")
-    images, labels, _ = load_data(DATA_DIR)
+    images, labels, _ = load_data()
     
     # Split data
     X_train, X_val, y_train, y_val = train_test_split(
