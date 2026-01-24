@@ -7,4 +7,6 @@ pyautogui>=0.9.54
 Pillow>=9.0.0
 mediapipe>=0.10.0
 ultralytics>=8.0.0
+flask>=2.3.0
+flask-cors>=4.0.0
 

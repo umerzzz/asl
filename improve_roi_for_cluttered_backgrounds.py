@@ -26,7 +26,6 @@ def analyze_training_image_format():
     if not sample_paths:
         print("[ERROR] No training images found")
         return
-    
     print("\nSample training images:")
     for class_name, path in sample_paths:
         img = cv2.imread(path)
