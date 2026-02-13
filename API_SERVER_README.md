@@ -85,24 +85,29 @@ Predict ASL sign from an image.
 **Request Body:**
 ```json
 {
-  "image": "data:image/jpeg;base64,/9j/4AAQSkZJRg..."
+  "image": "data:image/jpeg;base64,/9j/4AAQSkZJRg...",
+  "isNumber": true
 }
 ```
 
-The image can be:
-- Base64 encoded string
-- Data URL format (`data:image/jpeg;base64,...`)
+- `image` (required): The image to classify. It can be:
+  - Base64 encoded string
+  - Data URL format (`data:image/jpeg;base64,...`)
+- `isNumber` (optional, default: `false`):
+  - When `true`, the server restricts prediction to **digit** classes (`"0"`–`"9"`).
+  - When `false` or omitted, the server restricts prediction to **alphabet** classes (`"A"`–`"Z"`).
+  - If filtering by mode would result in no valid classes, the server falls back to using the full, unfiltered prediction distribution.
 
 **Response:**
 ```json
 {
   "success": true,
-  "predicted_class": "A",
+  "predicted_class": "4",
   "confidence": 0.95,
   "top3": [
-    ["A", 0.95],
+    ["4", 0.95],
     ["B", 0.03],
-    ["C", 0.02]
+    ["3", 0.02]
   ]
 }
 ```

@@ -21,6 +21,8 @@ IMG_SIZE = 64
 MODEL_PATH = os.path.join(os.path.dirname(__file__), 'asl_model.keras')
 CLASS_NAMES_PATH = os.path.join(os.path.dirname(__file__), 'class_names.pkl')
 CONFIDENCE_THRESHOLD = 0.70
+NUMBER_CLASS_LABELS = [str(i) for i in range(10)]  # "0" - "9"
+ALPHABET_CLASS_LABELS = [chr(ord('A') + i) for i in range(26)]  # "A" - "Z"
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for Next.js frontend
@@ -28,10 +30,12 @@ CORS(app)  # Enable CORS for Next.js frontend
 # Global model instance (loaded once at startup)
 model = None
 class_names = None
+number_class_indices = []
+alphabet_class_indices = []
 
 def load_model():
     """Load the ASL recognition model and class names"""
-    global model, class_names
+    global model, class_names, number_class_indices, alphabet_class_indices
     
     print("Loading ASL recognition model...")
     try:
@@ -57,6 +61,16 @@ def load_model():
             class_names = pickle.load(f)
         print(f"✓ Class names loaded: {len(class_names)} classes")
         print(f"  Classes: {class_names[:10]}..." if len(class_names) > 10 else f"  Classes: {class_names}")
+
+        # Precompute indices for number and alphabet classes for fast filtering
+        number_class_indices = [
+            idx for idx, name in enumerate(class_names) if str(name) in NUMBER_CLASS_LABELS
+        ]
+        alphabet_class_indices = [
+            idx for idx, name in enumerate(class_names) if str(name) in ALPHABET_CLASS_LABELS
+        ]
+        print(f"  Number class indices: {number_class_indices}")
+        print(f"  Alphabet class indices: {alphabet_class_indices}")
     except Exception as e:
         print(f"✗ Error loading class names: {e}")
         raise
@@ -161,7 +175,7 @@ def predict():
                 'error': 'Model not loaded'
             }), 500
         
-        # Get image from request
+        # Get image and optional mode hint from request
         data = request.get_json()
         if not data or 'image' not in data:
             return jsonify({
@@ -170,6 +184,7 @@ def predict():
             }), 400
         
         image_base64 = data['image']
+        is_number_mode = bool(data.get('isNumber', False))
         
         # Decode image
         try:
@@ -184,17 +199,34 @@ def predict():
         preprocessed = preprocess_image(image_array)
         
         # Make prediction
-        predictions = model.predict(preprocessed, verbose=0)
-        
+        predictions = model.predict(preprocessed, verbose=0)[0]
+
+        # Optionally restrict predictions to numbers or alphabets based on mode
+        filtered_probs = predictions.copy()
+        if is_number_mode and number_class_indices:
+            # Zero out all non-number classes
+            mask = np.zeros_like(filtered_probs)
+            mask[number_class_indices] = 1.0
+            filtered_probs *= mask
+        elif (not is_number_mode) and alphabet_class_indices:
+            # Zero out all non-alphabet classes
+            mask = np.zeros_like(filtered_probs)
+            mask[alphabet_class_indices] = 1.0
+            filtered_probs *= mask
+
+        # Fallback: if filter produced all zeros, use original predictions
+        if np.all(filtered_probs == 0):
+            filtered_probs = predictions
+
         # Get top prediction
-        confidence = float(np.max(predictions[0]))
-        predicted_class_idx = int(np.argmax(predictions[0]))
+        predicted_class_idx = int(np.argmax(filtered_probs))
+        confidence = float(filtered_probs[predicted_class_idx])
         predicted_class = class_names[predicted_class_idx]
         
         # Get top 3 predictions
-        top3_indices = np.argsort(predictions[0])[-3:][::-1]
+        top3_indices = np.argsort(filtered_probs)[-3:][::-1]
         top3 = [
-            [class_names[i], float(predictions[0][i])]
+            [class_names[i], float(filtered_probs[i])]
             for i in top3_indices
         ]
         
